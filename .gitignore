@@ -1,0 +1,21 @@
+# ESP-IDF Build Folders
+/build/
+/build_*_*/
+
+# Component Manager Dependencies & Locks
+/managed_components/
+dependencies.lock
+
+# Local Configuration Files
+sdkconfig
+sdkconfig.old
+
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
