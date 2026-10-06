@@ -1,7 +1,11 @@
-#ifndef EDITOR_H
-#define EDITOR_H
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 void editor_init(void);
-void editor_process(void);
 
+#ifdef __cplusplus
+}
 #endif
