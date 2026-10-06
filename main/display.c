@@ -4,6 +4,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -19,6 +20,8 @@
 #include "lvgl.h"
 #include "display.h"
 
+LV_FONT_DECLARE(lv_font_unscii_8);
+
 static const char *TAG = "DISPLAY";
 
 #define PIN_NUM_MOSI       23
@@ -29,12 +32,12 @@ static const char *TAG = "DISPLAY";
 #define PIN_NUM_BK_LIGHT   32
 
 #define LCD_HOST SPI2_HOST
-#define LCD_WIDTH   135
-#define LCD_HEIGHT  240
+#define LCD_WIDTH   240
+#define LCD_HEIGHT  135
 
 static lv_obj_t *text_label = NULL;
+static SemaphoreHandle_t xGuiSemaphore = NULL;
 
-// --- LVGL Bridge Functions ---
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t) drv->user_data;
@@ -47,20 +50,25 @@ static void increase_lvgl_tick(void *arg)
     lv_tick_inc(2);
 }
 
-// LVGL Background Worker Task
 static void lvgl_task(void *pvParameters)
 {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10));
-        lv_timer_handler();
+        
+        // Lock GUI before letting LVGL process rendering
+        if (xSemaphoreTake(xGuiSemaphore, portMAX_DELAY)) {
+            lv_timer_handler();
+            xSemaphoreGive(xGuiSemaphore);
+        }
     }
 }
 
 void display_init(void)
 {
-    ESP_LOGI(TAG, "Initializing ST7789 Display & LVGL...");
+    ESP_LOGI(TAG, "Initializing ST7789 Display in Landscape & LVGL...");
 
-    // Backlight
+    xGuiSemaphore = xSemaphoreCreateMutex();
+
     gpio_config_t bk_config = {
         .pin_bit_mask = 1ULL << PIN_NUM_BK_LIGHT,
         .mode = GPIO_MODE_OUTPUT,
@@ -68,7 +76,6 @@ void display_init(void)
     ESP_ERROR_CHECK(gpio_config(&bk_config));
     gpio_set_level((gpio_num_t)PIN_NUM_BK_LIGHT, 1);
 
-    // SPI Bus
     spi_bus_config_t buscfg = {
         .sclk_io_num = PIN_NUM_CLK,
         .mosi_io_num = PIN_NUM_MOSI,
@@ -79,12 +86,11 @@ void display_init(void)
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
-    // Panel IO
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = PIN_NUM_DC,
         .cs_gpio_num = PIN_NUM_CS,
-        .pclk_hz = 10 * 1000 * 1000,
+        .pclk_hz = 20 * 1000 * 1000,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
@@ -92,7 +98,6 @@ void display_init(void)
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle));
 
-    // Panel Device
     esp_lcd_panel_handle_t panel = NULL;
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = PIN_NUM_RST,
@@ -105,22 +110,20 @@ void display_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // ST7789 Geometry & Color Settings
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, true, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel, false));
-    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, 52, 40));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, true, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, 40, 52));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // LVGL Setup
     lv_init();
 
-    lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(LCD_WIDTH * 40 * sizeof(lv_color_t), MALLOC_CAP_DMA);
-    lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(LCD_WIDTH * 40 * sizeof(lv_color_t), MALLOC_CAP_DMA);
+    lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(LCD_WIDTH * 30 * sizeof(lv_color_t), MALLOC_CAP_DMA);
+    lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(LCD_WIDTH * 30 * sizeof(lv_color_t), MALLOC_CAP_DMA);
     
     static lv_disp_draw_buf_t disp_buf;
-    lv_disp_draw_buf_init(&disp_buf, buf1, buf2, LCD_WIDTH * 40);
+    lv_disp_draw_buf_init(&disp_buf, buf1, buf2, LCD_WIDTH * 30);
 
     static lv_disp_drv_t disp_drv;
     lv_disp_drv_init(&disp_drv);
@@ -131,7 +134,6 @@ void display_init(void)
     disp_drv.user_data = panel;
     lv_disp_drv_register(&disp_drv);
 
-    // Tick Timer
     const esp_timer_create_args_t lvgl_tick_timer_args = {
         .callback = &increase_lvgl_tick,
         .name = "lvgl_tick"
@@ -140,23 +142,27 @@ void display_init(void)
     ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, 2000));
 
-    // Build Initial UI Layout
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
     text_label = lv_label_create(scr);
-    lv_label_set_text(text_label, "RHEMA WRITER\nReady...");
+    lv_label_set_recolor(text_label, true); 
+    
+    lv_obj_set_style_text_font(text_label, &lv_font_unscii_8, 0);
     lv_obj_set_style_text_color(text_label, lv_color_hex(0x00FF00), 0);
     lv_obj_set_style_text_align(text_label, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_align(text_label, LV_ALIGN_TOP_LEFT, 10, 10);
+    lv_obj_align(text_label, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    // Spawn LVGL handler task
     xTaskCreate(lvgl_task, "lvgl_task", 4096, NULL, 2, NULL);
 }
 
 void display_set_text(const char *text)
 {
-    if (text_label) {
-        lv_label_set_text(text_label, text);
+    // Lock GUI before modifying the text label
+    if (text_label && xGuiSemaphore) {
+        if (xSemaphoreTake(xGuiSemaphore, portMAX_DELAY)) {
+            lv_label_set_text(text_label, text);
+            xSemaphoreGive(xGuiSemaphore);
+        }
     }
 }
